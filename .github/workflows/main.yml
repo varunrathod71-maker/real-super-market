@@ -15,124 +15,128 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repository
+      # 1. Download repository
+      - name: Checkout project
         uses: actions/checkout@v5
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v5
+      # 2. Install Java
+      - name: Setup Java 17
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. Install Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0 platform-tools'
+
+      # 4. Find the Android project
       - name: Find Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          find_settings() {
+          find_project() {
             find "$1" -type f \
-              \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+              \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
               -not -path "*/.git/*" \
               -not -path "*/build/*" \
               -not -path "*/.gradle/*" \
               -print -quit || true
           }
 
-          SETTINGS_FILE="$(find_settings "$GITHUB_WORKSPACE")"
+          SETTINGS="$(find_project "$GITHUB_WORKSPACE")"
 
-          # Extract the project ZIP if the source files aren't extracted yet.
-          if [ -z "$SETTINGS_FILE" ]; then
-            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 6 \
+          # Extract ZIP if project has not been extracted
+          if [ -z "$SETTINGS" ]; then
+            ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
               -type f -iname "*.zip" \
               -not -path "*/.git/*" \
               -print -quit || true)"
 
             if [ -n "$ZIP_FILE" ]; then
-              echo "Extracting: $ZIP_FILE"
-              mkdir -p "$RUNNER_TEMP/project-source"
-              unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/project-source"
-
-              SETTINGS_FILE="$(find_settings "$RUNNER_TEMP/project-source")"
+              mkdir -p "$RUNNER_TEMP/source"
+              unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/source"
+              SETTINGS="$(find_project "$RUNNER_TEMP/source")"
             fi
           fi
 
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::Android project settings.gradle(.kts) not found."
-            echo "Repository files:"
-            find "$GITHUB_WORKSPACE" -maxdepth 5 -type f | sort | head -200
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Could not find settings.gradle(.kts)."
+            find "$GITHUB_WORKSPACE" -maxdepth 5 -type f | head -200
             exit 1
           fi
 
-          PROJECT_DIR="$(cd "$(dirname "$SETTINGS_FILE")" && pwd)"
+          PROJECT="$(dirname "$SETTINGS")"
 
-          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
-             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
-            echo "::error::The Android app module was not found."
-            find "$PROJECT_DIR" -maxdepth 4 -type f | sort | head -200
+          if [ ! -f "$PROJECT/app/build.gradle.kts" ] && \
+             [ ! -f "$PROJECT/app/build.gradle" ]; then
+            echo "::error::The app module is missing."
             exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Found project at: $PROJECT"
 
-          echo "Android project found:"
-          echo "$PROJECT_DIR"
-
-      - name: Install Gradle 8.10.2
+      # 5. Install compatible Gradle
+      - name: Install Gradle
         shell: bash
         run: |
           set -euo pipefail
 
           VERSION="8.10.2"
-          ZIP="$RUNNER_TEMP/gradle-${VERSION}-bin.zip"
+          FILE="$RUNNER_TEMP/gradle.zip"
 
           curl -fL --retry 3 \
             "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
-            -o "$ZIP"
+            -o "$FILE"
 
-          # Verify the official Gradle distribution checksum.
-          echo "31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26  $ZIP" \
-            | sha256sum --check
+          echo "31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26  $FILE" \
+            | sha256sum -c -
 
-          unzip -q "$ZIP" -d "$RUNNER_TEMP"
-
+          unzip -q "$FILE" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/gradle-${VERSION}/bin" >> "$GITHUB_PATH"
 
-          "$RUNNER_TEMP/gradle-${VERSION}/bin/gradle" --version
-
+      # 6. Build APK
       - name: Build Debug APK
         shell: bash
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -Eeuo pipefail
-
           set +e
-          gradle :app:assembleDebug --no-daemon --stacktrace \
-            2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
 
-          BUILD_STATUS=${PIPESTATUS[0]}
+          gradle :app:assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            2>&1 | tee "$RUNNER_TEMP/build-log.txt"
+
+          RESULT=${PIPESTATUS[0]}
           set -e
 
-          if [ "$BUILD_STATUS" -ne 0 ]; then
+          if [ "$RESULT" -ne 0 ]; then
             echo ""
-            echo "========== ACTUAL BUILD ERROR =========="
-            tail -n 160 "$RUNNER_TEMP/gradle-build.log"
-            echo "========================================="
-            exit "$BUILD_STATUS"
+            echo "========= BUILD ERROR DETAILS ========="
+            tail -n 180 "$RUNNER_TEMP/build-log.txt"
+            echo "========================================"
+            exit "$RESULT"
           fi
 
+      # 7. Verify APK
       - name: Verify APK
         shell: bash
         run: |
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -s "$APK" ]; then
-            echo "::error::APK file was not generated."
+            echo "::error::APK was not generated."
             exit 1
           fi
 
-          echo "APK successfully generated:"
+          echo "APK generated successfully:"
           ls -lh "$APK"
 
+      # 8. Upload APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
