@@ -23,45 +23,41 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          # No Gradle cache here. This avoids the missing-file error.
 
-      - name: Find Android project or extract ZIP
+      - name: Find Android project
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Checking repository for Android project..."
 
           find_settings() {
             find "$1" -type f \
               \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
               -not -path "*/.git/*" \
               -not -path "*/build/*" \
+              -not -path "*/.gradle/*" \
               -print -quit || true
           }
 
           SETTINGS_FILE="$(find_settings "$GITHUB_WORKSPACE")"
 
-          # If only the ZIP was uploaded, extract it automatically.
+          # Extract the project ZIP if the source files aren't extracted yet.
           if [ -z "$SETTINGS_FILE" ]; then
-            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -type f -iname "*.zip" \
-              -not -path "*/.git/*" -print -quit || true)"
+            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 6 \
+              -type f -iname "*.zip" \
+              -not -path "*/.git/*" \
+              -print -quit || true)"
 
             if [ -n "$ZIP_FILE" ]; then
-              echo "Found project ZIP: $ZIP_FILE"
+              echo "Extracting: $ZIP_FILE"
+              mkdir -p "$RUNNER_TEMP/project-source"
+              unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/project-source"
 
-              EXTRACT_DIR="$GITHUB_WORKSPACE/.build-source"
-              mkdir -p "$EXTRACT_DIR"
-              unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
-
-              SETTINGS_FILE="$(find_settings "$EXTRACT_DIR")"
+              SETTINGS_FILE="$(find_settings "$RUNNER_TEMP/project-source")"
             fi
           fi
 
-          # Stop with a useful message if the source is missing.
           if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::Android Gradle project not found."
-            echo "Upload the project ZIP or its extracted source files."
+            echo "::error::Android project settings.gradle(.kts) not found."
             echo "Repository files:"
             find "$GITHUB_WORKSPACE" -maxdepth 5 -type f | sort | head -200
             exit 1
@@ -71,28 +67,58 @@ jobs:
 
           if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
              [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
-            echo "::error::Found Gradle settings, but the app module is missing."
-            echo "Project location: $PROJECT_DIR"
+            echo "::error::The Android app module was not found."
             find "$PROJECT_DIR" -maxdepth 4 -type f | sort | head -200
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Android project found: $PROJECT_DIR"
+
+          echo "Android project found:"
+          echo "$PROJECT_DIR"
 
       - name: Install Gradle 8.10.2
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.10.2'
-          cache-disabled: true
-          validate-wrappers: false
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="8.10.2"
+          ZIP="$RUNNER_TEMP/gradle-${VERSION}-bin.zip"
+
+          curl -fL --retry 3 \
+            "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+            -o "$ZIP"
+
+          # Verify the official Gradle distribution checksum.
+          echo "31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26  $ZIP" \
+            | sha256sum --check
+
+          unzip -q "$ZIP" -d "$RUNNER_TEMP"
+
+          echo "$RUNNER_TEMP/gradle-${VERSION}/bin" >> "$GITHUB_PATH"
+
+          "$RUNNER_TEMP/gradle-${VERSION}/bin/gradle" --version
 
       - name: Build Debug APK
         shell: bash
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          gradle --version
-          gradle :app:assembleDebug --no-daemon --stacktrace
+          set -Eeuo pipefail
+
+          set +e
+          gradle :app:assembleDebug --no-daemon --stacktrace \
+            2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo ""
+            echo "========== ACTUAL BUILD ERROR =========="
+            tail -n 160 "$RUNNER_TEMP/gradle-build.log"
+            echo "========================================="
+            exit "$BUILD_STATUS"
+          fi
 
       - name: Verify APK
         shell: bash
@@ -100,10 +126,11 @@ jobs:
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -s "$APK" ]; then
-            echo "::error::APK was not generated."
+            echo "::error::APK file was not generated."
             exit 1
           fi
 
+          echo "APK successfully generated:"
           ls -lh "$APK"
 
       - name: Upload APK
